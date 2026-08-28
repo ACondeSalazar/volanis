@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "volanis"
+version = "0.2.0"
+description = "Scale analysis and interpolation for anisotropic histology volumes"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "scipy",
+    "pyvips",
+    "matplotlib",
+    "tqdm",
+    "scikit-image",
+]
+
+[project.optional-dependencies]
+mccann = ["torch", "geomloss", "pykeops"]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools.packages.find]
+include = ["volanis*"]
+
+[tool.ruff]
+line-length = 100
