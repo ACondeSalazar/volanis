@@ -18,10 +18,6 @@ dependencies = [
 
 [project.optional-dependencies]
 mccann = ["torch", "geomloss", "pykeops"]
-dev = ["pytest", "ruff"]
 
 [tool.setuptools.packages.find]
 include = ["volanis*"]
-
-[tool.ruff]
-line-length = 100
