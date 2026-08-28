@@ -15,3 +15,7 @@ import volanis
 volume = volanis.open_volume("slices", xy_spacing_um=0.325, z_spacing_um=24)
 volanis.interpolate_linear(volume, "output", frames_between=5)
 ```
+
+
+# Todo list
+- Migrate autocorrelation to cupy to use GPU
