@@ -5,9 +5,13 @@ Made to handle large datasets.
 
 ```sh
 pip install -e .
-# with McCann Optimal Transport interpolation support
-pip install -e ".[mccann]"
+# with McCann interpolation and Wasserstein evaluation support
+pip install -e ".[ot]"
 ```
+
+Run these commands from the project folder.
+Evaluation uses Pearson and SSIM by default. To also use Wasserstein, install
+`.[ot]` and pass `metrics=("pearson", "ssim", "wasserstein")`.
 
 ```python
 import volanis

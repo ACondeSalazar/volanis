@@ -105,7 +105,7 @@ def plot_cross_section(volume, direction="xz", index=None, stretch=1.0):
     return fig
 
 
-def plot_scores(results, *, metrics=("pearson", "ssim", "wasserstein")):
+def plot_scores(results, *, metrics=("pearson", "ssim")):
     """One panel per metric: score against section gap, one line per method.
 
     `results` is {label: sweep_gaps output}. Error bars are the 95% interval on the mean,
@@ -136,7 +136,7 @@ def plot_scores(results, *, metrics=("pearson", "ssim", "wasserstein")):
     return fig
 
 
-def plot_coarse_scores(results, *, metrics=("pearson", "ssim", "wasserstein")):
+def plot_coarse_scores(results, *, metrics=("pearson", "ssim")):
     """Plot coarse-graining scores, one line per interpolation method."""
     import matplotlib.pyplot as plt
     import numpy as np

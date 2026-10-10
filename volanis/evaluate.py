@@ -101,7 +101,7 @@ def compare(truth, prediction, xy_spacing_um, metrics=("pearson", "ssim")):
         raise ValueError(f"unknown metrics {unknown}; choose from {sorted(METRICS)}")
     return {m: METRICS[m](truth, prediction, xy_spacing_um) for m in metrics}
 
-def score_reconstruction(truth, reconstructed, keep_every, *, channel=0,metrics=("pearson", "ssim", "wasserstein")):
+def score_reconstruction(truth, reconstructed, keep_every, *, channel=0, metrics=("pearson", "ssim")):
     """compare a volume and its interpolated counterpart"""
     indices, values = [], {m: [] for m in metrics}
     for index in range(min(len(truth), len(reconstructed))):
@@ -118,7 +118,7 @@ def score_reconstruction(truth, reconstructed, keep_every, *, channel=0,metrics=
 
 def sweep_coarse_graining(volume, output_root, interpolate, keep_every, coarse_grainings,
                           *, deconvolve=False, channel=0,
-                          metrics=("pearson", "ssim", "wasserstein")):
+                          metrics=("pearson", "ssim")):
     """coarsen, interpolate, then compare against ground truth"""
     if deconvolve:
         raise NotImplementedError("deconvolution is not implemented yet")
@@ -138,7 +138,7 @@ def sweep_coarse_graining(volume, output_root, interpolate, keep_every, coarse_g
 
 
 def sweep_gaps(volume, output_root, interpolate, keep_everys, *, channel=0,
-               metrics=("pearson", "ssim", "wasserstein")):
+               metrics=("pearson", "ssim")):
     """
     compute score reconstruction with different gaps 
     example :

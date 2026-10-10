@@ -10,14 +10,14 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy",
     "scipy",
-    "pyvips",
+    "pyvips[binary]",
     "matplotlib",
     "tqdm",
     "scikit-image",
 ]
 
 [project.optional-dependencies]
-mccann = ["torch", "geomloss", "pykeops"]
+ot = ["torch", "geomloss", "pykeops"]
 
 [tool.setuptools.packages.find]
 include = ["volanis*"]
