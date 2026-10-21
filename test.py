@@ -2,7 +2,7 @@ import os
 
 import volanis
 
-DATA = "/home/arthur/Documents/datasets/Dataset3-LSP22409_fused"
+DATA = "/media/T7/pi_playground/volanis/lsp22409/ex"
 OUTPUT = "./out/"
 LEVEL = 0
 GAPS = (2, 3, 4, 5, 6)
@@ -15,8 +15,9 @@ volume = volanis.open_volume(DATA, xy_spacing_um=0.14, z_spacing_um=0.28)
 truth = volume.at_level(LEVEL)
 print(truth.shape)
 
+
 acf_path = os.path.join(OUTPUT, "autocorrelation.npz")
-volanis.autocorrelation(truth, acf_path, tile_size=2048, max_tiles=5, channels=[0])
+volanis.autocorrelation(truth, acf_path, tile_size=1024, max_tiles=200, channels=[0])
 fits = volanis.fit(acf_path)
 volanis.plot_autocorrelation(fits).savefig(
     os.path.join(OUTPUT, "autocorrelation.png"), dpi=150)

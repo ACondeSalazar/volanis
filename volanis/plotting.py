@@ -53,7 +53,7 @@ def plot_autocorrelation(fits, *, channel_names=None, log_y=True, max_lag_um=Non
             lines = []
             for i, model_fit in enumerate(getattr(fits, direction)[channel].values()):
                 if model_fit.status != "failed":
-                    ax.plot(lags, clamp(model_fit.fitted_curve),
+                    ax.plot(lags[1:], clamp(model_fit.fitted_curve),
                             ls=LINESTYLES[i % len(LINESTYLES)], lw=1.4,
                             label=model_fit.model)
                 lines.append(_summary(model_fit, len(lags)))
