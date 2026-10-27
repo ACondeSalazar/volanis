@@ -8,7 +8,7 @@ import numpy as np
 import pyvips
 from tqdm import tqdm
 
-pyvips.cache_set_max(0) # lower ram usage
+#pyvips.cache_set_max(0) # lower ram usage
 
 VIPS_TO_NP = {
     "uchar": np.uint8, "char": np.int8, "ushort": np.uint16, "short": np.int16,
@@ -178,15 +178,19 @@ class Volume:
             raise ValueError(f"keep_every must be >= 1, got {keep_every}")
         return self.keep_only(range(0, len(self), keep_every))
 
-    def read_region(self, index, x, y, width, height):
-        """(height, width, channels) from one section, at the current pyramid level."""
+    def read_region(self, index, x, y, width, height, *, channel: int | None = None):
+        """Return (height, width, channels), with one band when channel is specified."""
         img = self._open(index)
         if width <= 0 or height <= 0:
-            raise ValueError(f"region must be non-empty, got {width}x{height}")
+            raise ValueError(f"region must be non empty, got {width}x{height}")
         if x < 0 or y < 0 or x + width > img.width or y + height > img.height:
-            raise ValueError(f"region ({x}, {y}, {width}, {height}) outside "
-                             f"{img.width}x{img.height} section {index}")
-        return _to_numpy(img.crop(x, y, width, height))
+            raise ValueError(f"region ({x}, {y}, {width}, {height}) outside " f"{img.width}x{img.height} section {index}")
+        region = img.crop(x, y, width, height)
+        if channel is not None:
+            if not isinstance(channel, (int, np.integer)) or not 0 <= channel < img.bands:
+                raise ValueError(f"channel {channel} outside 0..{img.bands - 1}")
+            region = region.extract_band(int(channel))
+        return _to_numpy(region)
 
     def read_slice(self, index):
         """(y, x, channels) for one whole section, at the current level."""

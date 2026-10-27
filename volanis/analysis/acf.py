@@ -7,9 +7,8 @@ import torch
 from scipy.fft import next_fast_len
 from tqdm import tqdm
 
-from ..volume import Volume, tile_grid
-
-OVERVIEW_MAX_PX = 2048
+from ..volume import Volume
+from .sampling import sample_tiles
 
 
 @dataclass(frozen=True)
@@ -59,45 +58,6 @@ class AutocorrelationResult:
         return cls(curves["xy"], curves["z"], meta)
 
 
-def _overview(volume: Volume):
-    level = volume.level
-    size = max(volume.shape[1:3])
-
-    while size > OVERVIEW_MAX_PX:
-        if volume.has_pyramid and level + 1 >= volume.n_levels:
-            break
-        level += 1
-        size = (size + 1) // 2
-
-    scale = 2 ** (level - volume.level)
-    return volume.at_level(level).read_slice(len(volume) // 2), scale
-
-
-def _select_tiles(overview, scale, channel, width, height, tile_size, max_tiles, tissue_fraction):
-    plane = overview[..., channel]
-    threshold = tissue_fraction * float(plane.mean())
-    candidates = []
-
-    for tile in tile_grid(width, height, tile_size, overlap = tile_size // 2):
-        if tile.width != tile_size or tile.height != tile_size:
-            continue
-
-        start_x = tile.x // scale
-        start_y = tile.y // scale
-        stop_x = (tile.x + tile_size + scale - 1) // scale
-        stop_y = (tile.y + tile_size + scale - 1) // scale
-
-        if plane[start_y:stop_y, start_x:stop_x].mean() >= threshold:
-            candidates.append(tile)
-
-    if not candidates:
-        raise ValueError(f"channel {channel}: no full {tile_size}x{tile_size} signal tile found")
-
-    count = min(max_tiles, len(candidates))
-    indices = np.linspace(0, len(candidates) - 1, count).round().astype(int)
-    return [candidates[index] for index in indices]
-
-
 def _radial_average(plane: np.ndarray, max_radius: int) -> np.ndarray:
     center = plane.shape[0] // 2
     rows, columns = np.indices(plane.shape)
@@ -108,35 +68,43 @@ def _radial_average(plane: np.ndarray, max_radius: int) -> np.ndarray:
     return sums / counts
 
 
-def _cube_profiles(cube: np.ndarray, max_radius: int, max_z_lag: int, device: str = "cpu", chunk: int = 4):
-    """covariance corrected for overlap and normalized at lag zero for each tile"""
+def _cube_profiles(
+    cube: torch.Tensor,
+    max_radius: int,
+    max_z_lag: int,
+    chunk: int = 2,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Center the tile in place and return normalized XY and Z autocorrelations."""
     depth, height, width = cube.shape
-    centered = cube - cube.mean(dtype=np.float32)
 
-    # pad by max_radius to avoid wraparound in the xy plane
-    ny = next_fast_len(height + max_radius)
-    nx = next_fast_len(width + max_radius)
+    # Padding prevents wraparound within the requested XY lag range.
+    padded_height = next_fast_len(height + max_radius)
+    padded_width = next_fast_len(width + max_radius)
+    fft_shape = (padded_height, padded_width)
 
     with torch.no_grad():
-        # z=0 plane: sum over z of each slice's 2D power spectrum, a few slices at a time
-        power = torch.zeros((ny, nx // 2 + 1), dtype=torch.float32, device=device)
+        cube -= cube.mean()
+
+        power = torch.zeros(
+            (padded_height, padded_width // 2 + 1),
+            dtype=torch.float32,
+            device=cube.device,
+        )
         for start in range(0, depth, chunk):
-            block = torch.as_tensor(centered[start:start + chunk], dtype=torch.float32, device=device)
-            power += torch.fft.rfft2(block, s=(ny, nx)).abs().square().sum(dim=0)
-            del block
-        plane = torch.fft.irfft2(power, s=(ny, nx)).cpu().numpy()
+            block = cube[start:start + chunk]
+            power += torch.fft.rfft2(block, s=fft_shape).abs().square().sum(dim=0)
+        plane = torch.fft.irfft2(power, s=fft_shape).cpu().numpy()
         del power
 
-        # z axis at x=y=0: direct dot products between shifted copies, no FFT, no padding
-        tensor = torch.as_tensor(centered, dtype=torch.float32, device=device)
-        z_cov = torch.stack([
-            torch.dot(tensor[:depth - lag].reshape(-1), tensor[lag:].reshape(-1))
-            for lag in range(max_z_lag + 1)
-        ]).cpu().numpy().astype(np.float64)
-        del tensor
+        z_covariances = []
+        for lag in range(max_z_lag + 1):
+            left = cube[:depth - lag].reshape(-1)
+            right = cube[lag:].reshape(-1)
+            z_covariances.append(torch.dot(left, right))
+        z_covariance = torch.stack(z_covariances).cpu().numpy().astype(np.float64)
 
     z_pairs = (depth - np.arange(max_z_lag + 1)) * float(height * width)
-    z_curve = z_cov / z_pairs
+    z_curve = z_covariance / z_pairs
     variance = z_curve[0]
 
     if not np.isfinite(variance) or variance <= 0:
@@ -161,77 +129,68 @@ def _profile(curves: list, spacing_um: float) -> Profile:
     return Profile(lags, mean, spacing_um)
 
 
-def autocorrelation(volume: Volume, output_path, *, channels=None, tile_size=1024, max_tiles=32, tissue_fraction=0.5, device="cpu"):
-    """average tile ACFs with equal weights, including lag zero in XY and Z
+def autocorrelation(volume: Volume,output_path,*,channels=None,tile_size: int = 1024,max_tiles: int | None = 32,tissue_fraction: float = 0.5,device: str = "cpu",seed: int = 0) -> AutocorrelationResult:
+    """Average full-depth tile ACFs with equal weights, including lag zero.
 
-    keep tiles whose mean reaches tissue_fraction times the channel's overview mean
-    this selects bright regions, it is not a tissue mask
+    tissue_fraction specifies Otsu signal coverage in each channel's mean Z overview.
     """
-    if device not in ("cpu", "cuda"):
-        raise ValueError("device must be 'cpu' or 'cuda'")
-    if device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("cuda seems unavailable")
+    if device not in ("cpu", "cuda"): raise ValueError("device must be 'cpu' or 'cuda'")
+    if device == "cuda" and not torch.cuda.is_available(): raise RuntimeError("cuda seems unavailable")
 
-    if tissue_fraction < 0:
-        raise ValueError("tissue_fraction must be nonnegative")
-
+    if not 0 <= tissue_fraction <= 1: raise ValueError("tissue_fraction must between 0 and 1")
+    
     depth, height, width, n_channels = volume.shape
-    if depth < 2:
-        raise ValueError("ACF requires at least two sections")
-
-    if not isinstance(tile_size, (int, np.integer)) or tile_size < 2:
-        raise ValueError("tile_size must be an integer >= 2")
-    if not isinstance(max_tiles, (int, np.integer)) or max_tiles < 1:
-        raise ValueError("max_tiles must be a positive integer")
-
+    
+    if tile_size > min(width, height): raise ValueError("tile_size is bigger than the image")
+    
     tile_size = int(tile_size)
-    max_tiles = int(max_tiles)
-
-    for spacing in (volume.xy_spacing_um, volume.z_spacing_um):
-        if not np.isfinite(spacing) or spacing <= 0:
-            raise ValueError("volume spacings must be finite and positive")
 
     if channels is None:
         channels = list(range(n_channels))
-    else:
-        channels = list(channels)
 
-    if not channels:
-        raise ValueError("channels must not be empty")
+    if not channels: raise ValueError("channels must not be empty")
 
     for index, channel in enumerate(channels):
         if not isinstance(channel, (int, np.integer)) or not 0 <= channel < n_channels:
             raise ValueError(f"channel {channel} outside 0..{n_channels - 1}")
         channels[index] = int(channel)
+    
+    selected_tiles_by_channel = sample_tiles(volume,channels=channels,tile_size=tile_size,max_tiles=max_tiles,tissue_fraction=tissue_fraction,seed=seed)
 
-    overview, scale = _overview(volume)
+    for channel in channels:
+        if not selected_tiles_by_channel[channel]: raise ValueError(f"channel {channel}: no full {tile_size}x{tile_size} signal tile found, try lowering tissue fraction or tile_size")
+
+    seed = int(seed)
+    cube = torch.empty((depth, tile_size, tile_size), dtype=torch.float32, device=device)
     xy = {}
     z = {}
     used_tiles = {}
 
     for channel in channels:
-        selected_tiles = _select_tiles(overview, scale, channel, width, height, tile_size, max_tiles, tissue_fraction)
+        selected_tiles = selected_tiles_by_channel[channel]
         xy_curves = []
         z_curves = []
         used_tiles[str(channel)] = []
 
         for tile in tqdm(selected_tiles, desc=f"acf channel {channel}"):
-            sections = []
             for section_index in range(depth):
-                region = volume.read_region(section_index, tile.x, tile.y, tile_size, tile_size)
-                sections.append(region[..., channel])
+                region = volume.read_region(
+                    section_index, tile.x, tile.y, tile_size, tile_size,
+                    channel=channel,
+                )
+                cube[section_index] = torch.from_numpy(region[..., 0])
+                del region
 
-            #print(np.stack(sections).shape)
-            profiles = _cube_profiles(np.stack(sections), tile_size // 2, depth // 2, device)
+            profiles = _cube_profiles(cube, tile_size // 2, depth // 2)
             if profiles is None:
                 continue
 
-            xy_curves.append(profiles[0])
-            z_curves.append(profiles[1])
+            xy_curve, z_curve = profiles
+            xy_curves.append(xy_curve)
+            z_curves.append(z_curve)
             used_tiles[str(channel)].append(list(tile))
 
-        if not xy_curves:
-            raise ValueError(f"channel {channel}: all selected tiles have zero or invalid variance")
+        if not xy_curves: raise ValueError(f"channel {channel}: all selected tiles have zero or invalid variance")
 
         xy[channel] = _profile(xy_curves, volume.xy_spacing_um)
         z[channel] = _profile(z_curves, volume.z_spacing_um)
