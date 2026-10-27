@@ -5,7 +5,6 @@ from ..volume import Tile, Volume
 
 OVERVIEW_MAX_PX = 1024
 
-
 def _axis_starts(start: int, stop: int, extent: int, tile_size: int) -> list[int]:
     # Preserve the requested tile size when the signal box is smaller than a tile.
     if stop - start < tile_size:
@@ -74,6 +73,8 @@ def sample_tiles(
         y_starts = _axis_starts(top, bottom, height, tile_size)
         columns = len(x_starts)
         grid_size = len(y_starts) * columns
+
+        #print("BB : ", right - left, bottom - top)
 
         rng = np.random.default_rng(np.random.SeedSequence([seed, channel]))
         tiles = []
