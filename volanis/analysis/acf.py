@@ -3,7 +3,8 @@ import os
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.fft import irfftn, next_fast_len, rfftn
+import torch
+from scipy.fft import next_fast_len
 from tqdm import tqdm
 
 from ..volume import Volume, tile_grid
@@ -77,7 +78,7 @@ def _select_tiles(overview, scale, channel, width, height, tile_size, max_tiles,
     threshold = tissue_fraction * float(plane.mean())
     candidates = []
 
-    for tile in tile_grid(width, height, tile_size):
+    for tile in tile_grid(width, height, tile_size, overlap = tile_size // 2):
         if tile.width != tile_size or tile.height != tile_size:
             continue
 
@@ -107,24 +108,41 @@ def _radial_average(plane: np.ndarray, max_radius: int) -> np.ndarray:
     return sums / counts
 
 
-def _cube_profiles(cube: np.ndarray, max_radius: int, max_z_lag: int):
+def _cube_profiles(cube: np.ndarray, max_radius: int, max_z_lag: int, device: str = "cpu", chunk: int = 4):
     """covariance corrected for overlap and normalized at lag zero for each tile"""
     depth, height, width = cube.shape
-    centered = cube - cube.mean(dtype=np.float64)
+    centered = cube - cube.mean(dtype=np.float32)
 
-    # pad by max_lag to avoid wraparound
-    shape = (next_fast_len(depth + max_z_lag), next_fast_len(height + max_radius), next_fast_len(width + max_radius))
-    spectrum = rfftn(centered.astype(np.float32), s=shape)
-    covariance = irfftn(spectrum * spectrum.conj(), s=shape)
+    # pad by max_radius to avoid wraparound in the xy plane
+    ny = next_fast_len(height + max_radius)
+    nx = next_fast_len(width + max_radius)
+
+    with torch.no_grad():
+        # z=0 plane: sum over z of each slice's 2D power spectrum, a few slices at a time
+        power = torch.zeros((ny, nx // 2 + 1), dtype=torch.float32, device=device)
+        for start in range(0, depth, chunk):
+            block = torch.as_tensor(centered[start:start + chunk], dtype=torch.float32, device=device)
+            power += torch.fft.rfft2(block, s=(ny, nx)).abs().square().sum(dim=0)
+            del block
+        plane = torch.fft.irfft2(power, s=(ny, nx)).cpu().numpy()
+        del power
+
+        # z axis at x=y=0: direct dot products between shifted copies, no FFT, no padding
+        tensor = torch.as_tensor(centered, dtype=torch.float32, device=device)
+        z_cov = torch.stack([
+            torch.dot(tensor[:depth - lag].reshape(-1), tensor[lag:].reshape(-1))
+            for lag in range(max_z_lag + 1)
+        ]).cpu().numpy().astype(np.float64)
+        del tensor
 
     z_pairs = (depth - np.arange(max_z_lag + 1)) * float(height * width)
-    z_curve = covariance[:max_z_lag + 1, 0, 0] / z_pairs
+    z_curve = z_cov / z_pairs
     variance = z_curve[0]
 
     if not np.isfinite(variance) or variance <= 0:
         return None
 
-    plane = np.fft.fftshift(covariance[0])
+    plane = np.fft.fftshift(plane)
     center_y, center_x = np.array(plane.shape) // 2
     rows = slice(center_y - max_radius, center_y + max_radius + 1)
     columns = slice(center_x - max_radius, center_x + max_radius + 1)
@@ -143,14 +161,19 @@ def _profile(curves: list, spacing_um: float) -> Profile:
     return Profile(lags, mean, spacing_um)
 
 
-def autocorrelation(volume: Volume, output_path, *, channels=None, tile_size=1024, max_tiles=32, tissue_fraction=0.5):
+def autocorrelation(volume: Volume, output_path, *, channels=None, tile_size=1024, max_tiles=32, tissue_fraction=0.5, device="cpu"):
     """average tile ACFs with equal weights, including lag zero in XY and Z
 
     keep tiles whose mean reaches tissue_fraction times the channel's overview mean
     this selects bright regions, it is not a tissue mask
     """
-    if not np.isfinite(tissue_fraction) or tissue_fraction < 0:
-        raise ValueError("tissue_fraction must be finite and nonnegative")
+    if device not in ("cpu", "cuda"):
+        raise ValueError("device must be 'cpu' or 'cuda'")
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("cuda seems unavailable")
+
+    if tissue_fraction < 0:
+        raise ValueError("tissue_fraction must be nonnegative")
 
     depth, height, width, n_channels = volume.shape
     if depth < 2:
@@ -160,7 +183,7 @@ def autocorrelation(volume: Volume, output_path, *, channels=None, tile_size=102
         raise ValueError("tile_size must be an integer >= 2")
     if not isinstance(max_tiles, (int, np.integer)) or max_tiles < 1:
         raise ValueError("max_tiles must be a positive integer")
-        
+
     tile_size = int(tile_size)
     max_tiles = int(max_tiles)
 
@@ -199,7 +222,7 @@ def autocorrelation(volume: Volume, output_path, *, channels=None, tile_size=102
                 sections.append(region[..., channel])
 
             #print(np.stack(sections).shape)
-            profiles = _cube_profiles(np.stack(sections), tile_size // 2, depth // 2)
+            profiles = _cube_profiles(np.stack(sections), tile_size // 2, depth // 2, device)
             if profiles is None:
                 continue
 
