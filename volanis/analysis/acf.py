@@ -1,15 +1,20 @@
 import json
 import os
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import lru_cache
 
 import numpy as np
 import torch
 from scipy.fft import next_fast_len
 from tqdm import tqdm
 
-from ..volume import Volume
+from ..volume import Tile, Volume
 from .sampling import sample_tiles
 
+
+SEED = 0 # seed for random numbers
 
 @dataclass(frozen=True)
 class Profile:
@@ -63,16 +68,13 @@ def _radial_average(plane: np.ndarray, max_radius: int) -> np.ndarray:
     rows, columns = np.indices(plane.shape)
     radius = np.rint(np.hypot(rows - center, columns - center)).astype(int).ravel()
 
-    counts = np.bincount(radius)[:max_radius + 1]
-    sums = np.bincount(radius, weights=plane.ravel())[:max_radius + 1]
+    counts = np.bincount(radius)[: max_radius + 1]
+    sums = np.bincount(radius, weights=plane.ravel())[: max_radius + 1]
     return sums / counts
 
 
 def _cube_profiles(
-    cube: torch.Tensor,
-    max_radius: int,
-    max_z_lag: int,
-    chunk: int = 2,
+    cube: torch.Tensor, max_radius: int, max_z_lag: int
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Center the tile in place and return normalized XY and Z autocorrelations."""
     depth, height, width = cube.shape
@@ -90,18 +92,23 @@ def _cube_profiles(
             dtype=torch.float32,
             device=cube.device,
         )
-        for start in range(0, depth, chunk):
-            block = cube[start:start + chunk]
-            power += torch.fft.rfft2(block, s=fft_shape).abs().square().sum(dim=0)
-        plane = torch.fft.irfft2(power, s=fft_shape).cpu().numpy()
+        for d in range(0, depth):
+            power += torch.fft.rfft2(cube[d], s=fft_shape).abs().square_()
+        plane = torch.fft.irfft2(power, s=fft_shape)
         del power
+
+        plane = torch.fft.fftshift(plane)
+        center_y, center_x = plane.shape[0] // 2, plane.shape[1] // 2
+        plane = plane[ center_y - max_radius : center_y + max_radius + 1, center_x - max_radius : center_x + max_radius + 1, ]
 
         z_covariances = []
         for lag in range(max_z_lag + 1):
-            left = cube[:depth - lag].reshape(-1)
+            left = cube[: depth - lag].reshape(-1)
             right = cube[lag:].reshape(-1)
             z_covariances.append(torch.dot(left, right))
-        z_covariance = torch.stack(z_covariances).cpu().numpy().astype(np.float64)
+
+        plane = plane.cpu().numpy()
+        z_covariance = torch.stack(z_covariances).cpu().numpy()
 
     z_pairs = (depth - np.arange(max_z_lag + 1)) * float(height * width)
     z_curve = z_covariance / z_pairs
@@ -109,12 +116,6 @@ def _cube_profiles(
 
     if not np.isfinite(variance) or variance <= 0:
         return None
-
-    plane = np.fft.fftshift(plane)
-    center_y, center_x = np.array(plane.shape) // 2
-    rows = slice(center_y - max_radius, center_y + max_radius + 1)
-    columns = slice(center_x - max_radius, center_x + max_radius + 1)
-    plane = plane[rows, columns]
 
     offsets = np.abs(np.arange(-max_radius, max_radius + 1))
     xy_pairs = depth * np.outer(height - offsets, width - offsets)
@@ -129,24 +130,45 @@ def _profile(curves: list, spacing_um: float) -> Profile:
     return Profile(lags, mean, spacing_um)
 
 
-def autocorrelation(volume: Volume,output_path,*,channels=None,tile_size: int = 1024,max_tiles: int | None = 32,tissue_fraction: float = 0.5,device: str = "cpu",seed: int = 0) -> AutocorrelationResult:
-    """Average full-depth tile ACFs with equal weights, including lag zero.
+def _load_cube( volume: Volume, tile: Tile, channel: int, cube: torch.Tensor, executor: ThreadPoolExecutor, n_workers: int ) -> None:
+    def load_section(section: int) -> torch.Tensor:
+        region = volume.read_region(section, *tile, channel=channel)
+        source = torch.from_numpy(region[..., 0])
+        return source
 
-    tissue_fraction specifies Otsu signal coverage in each channel's mean Z overview.
-    """
+    depth = len(volume)
+    pending = deque()
+    for section in range(min(n_workers, depth)):
+        pending.append(executor.submit(load_section, section))
+    next_section = len(pending)
+
+    for section in range(depth):
+        source = pending.popleft().result()
+        if next_section < depth:
+            pending.append(executor.submit(load_section, next_section))
+            next_section += 1
+
+        cube[section].copy_(source)
+
+        del source
+
+
+def autocorrelation( volume: Volume, output_path, *, channels=None, tile_size: int = 1024, max_tiles: int | None = 32, tissue_fraction: float = 0.1, device: str = "cuda", n_workers: int = 4) -> AutocorrelationResult:
+    """Average full-depth tile ACFs"""
+    if n_workers < 1: raise ValueError("n_workers must be positive")
+
     if device not in ("cpu", "cuda"): raise ValueError("device must be 'cpu' or 'cuda'")
     if device == "cuda" and not torch.cuda.is_available(): raise RuntimeError("cuda seems unavailable")
 
     if not 0 <= tissue_fraction <= 1: raise ValueError("tissue_fraction must between 0 and 1")
-    
+
     depth, height, width, n_channels = volume.shape
-    
+
     if tile_size > min(width, height): raise ValueError("tile_size is bigger than the image")
-    
+
     tile_size = int(tile_size)
 
-    if channels is None:
-        channels = list(range(n_channels))
+    if channels is None: channels = list(range(n_channels))
 
     if not channels: raise ValueError("channels must not be empty")
 
@@ -154,46 +176,41 @@ def autocorrelation(volume: Volume,output_path,*,channels=None,tile_size: int = 
         if not isinstance(channel, (int, np.integer)) or not 0 <= channel < n_channels:
             raise ValueError(f"channel {channel} outside 0..{n_channels - 1}")
         channels[index] = int(channel)
-    
-    selected_tiles_by_channel = sample_tiles(volume,channels=channels,tile_size=tile_size,max_tiles=max_tiles,tissue_fraction=tissue_fraction,seed=seed)
+
+    selected_tiles_by_channel = sample_tiles( volume, channels=channels, tile_size=tile_size, max_tiles=max_tiles, tissue_fraction=tissue_fraction, seed=SEED)
 
     for channel in channels:
-        if not selected_tiles_by_channel[channel]: raise ValueError(f"channel {channel}: no full {tile_size}x{tile_size} signal tile found, try lowering tissue fraction or tile_size")
+        if not selected_tiles_by_channel[channel]:
+            raise ValueError( f"channel {channel}: no full {tile_size}x{tile_size} signal tile found, try lowering tissue fraction or tile_size" )
 
-    seed = int(seed)
-    cube = torch.empty((depth, tile_size, tile_size), dtype=torch.float32, device=device)
+    cube = torch.empty( (depth, tile_size, tile_size), dtype=torch.float32, device=device )
     xy = {}
     z = {}
     used_tiles = {}
 
-    for channel in channels:
-        selected_tiles = selected_tiles_by_channel[channel]
-        xy_curves = []
-        z_curves = []
-        used_tiles[str(channel)] = []
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        for channel in channels:
+            selected_tiles = selected_tiles_by_channel[channel]
+            xy_curves = []
+            z_curves = []
+            used_tiles[str(channel)] = []
 
-        for tile in tqdm(selected_tiles, desc=f"acf channel {channel}"):
-            for section_index in range(depth):
-                region = volume.read_region(
-                    section_index, tile.x, tile.y, tile_size, tile_size,
-                    channel=channel,
-                )
-                cube[section_index] = torch.from_numpy(region[..., 0])
-                del region
+            for tile in tqdm(selected_tiles, desc=f"acf channel {channel}"):
+                _load_cube(volume, tile, channel, cube, executor, n_workers)
+                profiles = _cube_profiles(cube, tile_size // 2, depth // 2)
+                if profiles is None:
+                    continue
 
-            profiles = _cube_profiles(cube, tile_size // 2, depth // 2)
-            if profiles is None:
-                continue
+                xy_curve, z_curve = profiles
+                xy_curves.append(xy_curve)
+                z_curves.append(z_curve)
+                used_tiles[str(channel)].append(list(tile))
 
-            xy_curve, z_curve = profiles
-            xy_curves.append(xy_curve)
-            z_curves.append(z_curve)
-            used_tiles[str(channel)].append(list(tile))
+            if not xy_curves:
+                raise ValueError( f"channel {channel}: all selected tiles have zero or invalid variance" )
 
-        if not xy_curves: raise ValueError(f"channel {channel}: all selected tiles have zero or invalid variance")
-
-        xy[channel] = _profile(xy_curves, volume.xy_spacing_um)
-        z[channel] = _profile(z_curves, volume.z_spacing_um)
+            xy[channel] = _profile(xy_curves, volume.xy_spacing_um)
+            z[channel] = _profile(z_curves, volume.z_spacing_um)
 
     meta = {
         "channels": channels,

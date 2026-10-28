@@ -3,7 +3,7 @@ from skimage.filters import threshold_otsu
 
 from ..volume import Tile, Volume
 
-OVERVIEW_MAX_PX = 1024
+OVERVIEW_MAX_PX = 2048
 
 def _axis_starts(start: int, stop: int, extent: int, tile_size: int) -> list[int]:
     # Preserve the requested tile size when the signal box is smaller than a tile.
@@ -22,8 +22,7 @@ def _mean_overview(volume: Volume) -> tuple[np.ndarray, int]:
     level = volume.level
     size = max(volume.shape[1:3])
     while size > OVERVIEW_MAX_PX:
-        if volume.has_pyramid and level + 1 >= volume.n_levels:
-            raise ValueError("a smaller TIFF pyramid level is needed")
+        if volume.has_pyramid and level + 1 >= volume.n_levels: raise ValueError("a smaller TIFF pyramid level is needed")
         level += 1
         size = (size + 1) // 2
 
@@ -37,19 +36,8 @@ def _mean_overview(volume: Volume) -> tuple[np.ndarray, int]:
     return mean, 2 ** (level - volume.level)
 
 
-def sample_tiles(
-    volume: Volume,
-    *,
-    channels: list[int],
-    tile_size: int,
-    max_tiles: int | None,
-    tissue_fraction: float,
-    seed: int,
-) -> dict[int, list[Tile]]:
-    """Sample a grid inside each channel's Otsu signal bounding box.
-
-    tissue_fraction is the required fraction of above-threshold overview pixels.
-    """
+def sample_tiles( volume: Volume, *, channels: list[int], tile_size: int, max_tiles: int | None, tissue_fraction: float, seed: int, ) -> dict[int, list[Tile]]:
+    """For each channel : compute Otsu threshold on a smaller version of the volume, then compute the bounding box, then sample"""
     _, height, width, _ = volume.shape
     overview, scale = _mean_overview(volume)
     if tile_size < scale:
