@@ -222,12 +222,11 @@ def reencode(volume, output_folder, *, tile_size=256, compression="deflate"):
         if os.path.realpath(out) == os.path.realpath(name):
             raise ValueError(f"{output_folder} would overwrite the source section {name}")
 
-    for path in tqdm(volume.paths, desc="reencode"):
+    for index, path in enumerate(tqdm(volume.paths, desc="reencode")):
         out = os.path.join(output_folder, os.path.basename(path))
         if os.path.exists(out):
             continue
-        save_tiff(_level_image(path, volume.level, volume.has_pyramid, access="sequential"),
-                  out, tile_size=tile_size, compression=compression)
+        save_tiff( volume._open(index), out, tile_size=tile_size, compression=compression)
 
     return open_volume(output_folder, xy_spacing_um=volume.xy_spacing_um,
                        z_spacing_um=volume.z_spacing_um)
