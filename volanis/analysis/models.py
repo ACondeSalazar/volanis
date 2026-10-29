@@ -77,13 +77,23 @@ class AutocorrelationFit:
 
 
 def _fit_one(model: str, lags: np.ndarray, curve: np.ndarray) -> ModelFit:
+    extra = True
     function, n_lengths = MODELS[model]
+    n_core = 2 * n_lengths - 1
     max_lag = float(lags.max())
     lower = [0.0] * (n_lengths - 1) + [1e-6] * n_lengths
     upper = [1.0] * (n_lengths - 1) + [4 * max_lag] * n_lengths
     best = None
 
+    if extra:
+        base = function
+        function = lambda x, *p: p[-1] + p[-2] * base(x, *p[:-2])
+        lower += [0.0, -0.5]
+        upper += [2.0, 0.5]
+
     for initial in _starting_points(n_lengths, max_lag):
+        if extra:
+            initial = [*initial, 1.0, 0.0]
         try:
             parameters, covariance = curve_fit(function, lags, curve, p0=initial, bounds=(lower, upper), maxfev=20000)
         except (RuntimeError, ValueError):
@@ -99,8 +109,8 @@ def _fit_one(model: str, lags: np.ndarray, curve: np.ndarray) -> ModelFit:
         return ModelFit(model, empty, empty, empty, failed_curve, float("nan"), float("inf"), "failed")
 
     residual_sum, parameters, covariance = best
-    lengths = parameters[-n_lengths:]
-    errors = np.sqrt(np.diag(covariance))[-n_lengths:]
+    lengths = parameters[n_lengths - 1 : n_core]
+    errors = np.sqrt(np.diag(covariance))[n_lengths - 1 : n_core]
     weights = _weights(model, parameters)
     order = np.argsort(lengths)
 
